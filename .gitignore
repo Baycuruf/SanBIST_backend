@@ -1,0 +1,8 @@
+# Python sanal ortamı
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Diğer (macOS/Windows)
+.DS_Store
