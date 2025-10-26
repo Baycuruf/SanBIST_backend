@@ -298,17 +298,22 @@ def fetch_and_cache_data():
 def background_refresher():
     global last_successful_fetch_time
     
-    # 1. Adım: Önce statik verileri ÇEK (sadece 1 kez)
-    print("Arka plan yenileyici başlatıldı: Önce statik veriler çekiliyor...")
-    fetch_static_company_info() # Bu, yavaş olan ama 1 kez çalışan fonksiyon
-    print("Statik veriler çekildi.")
+    print("Arka plan yenileyici başlatıldı.")
     
-    # 2. Adım: İlk dinamik veriyi ÇEK
-    print("İlk dinamik veri çekme işlemi başlatılıyor...")
+    # 1. Adım: YAVAŞ olan statik veri çekmeyi KENDİ THREAD'İNDE başlat
+    # Bu, ana arka plan döngüsünü ENGELLEMEZ.
+    print("Statik hisse bilgileri (Ad, Sektör) için ayrı bir thread başlatılıyor...")
+    static_thread = threading.Thread(target=fetch_static_company_info, daemon=True)
+    static_thread.start()
+    
+    # 2. Adım: HIZLI olan ilk dinamik veriyi HEMEN ÇEK
+    # Bu, 'cached_data'yı hızlıca doldurur (isim/sektör olmadan)
+    # API bu sayede 503 hatası vermez, sadece ilk veride isim/sektör eksik olur.
+    print("İlk dinamik veri çekme işlemi başlatılıyor (API'yi hızlıca doldurmak için)...")
     fetch_and_cache_data()
-    print("İlk dinamik veri çekme işlemi tamamlandı.")
+    print("İlk dinamik veri çekme işlemi tamamlandı. API artık 'kısmen' hazır.")
 
-    # 3. Adım: Döngüye gir (15 dakikada bir dinamik verileri çek)
+    # 3. Adım: Normal 15 dakikalık döngüye gir
     while not stop_event.is_set():
         try:
             now_istanbul = datetime.now(istanbul_tz)
@@ -319,7 +324,7 @@ def background_refresher():
             if market_open and cache_age > CACHE_DURATION_SECONDS:
                 if not fetch_in_progress_event.is_set():
                      print(f"[{now_istanbul.strftime('%H:%M:%S')}] [BG] Zaman aşımı, dinamik veri çekme başlatılıyor...")
-                     fetch_and_cache_data()
+                     fetch_and_cache_data() # Bu, static_thread bittiyse artık isim/sektörleri de alacak
             
             # Piyasa kapalıysa ve önbellek 1 saatten eskiyse YENİLE (kapanış verilerini almak için)
             elif not market_open and cache_age > 3600: 
