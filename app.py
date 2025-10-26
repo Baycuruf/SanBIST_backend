@@ -8,6 +8,7 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
+import numpy as np # Aşamalı yükleme için
 
 # --- Hisse Senedi Sembolleri ---
 try:
@@ -17,7 +18,7 @@ except ImportError:
     BIST100_SYMBOLS = ["GARAN.IS", "AKBNK.IS", "THYAO.IS"]
     print(f"UYARI: Fallback sembol listesi kullanılıyor: {BIST100_SYMBOLS}")
 
-# --- Döviz/Emtia Sembolleri (Yapı Düzeltildi) ---
+# --- Döviz/Emtia Sembolleri ---
 COMMODITY_FOREX_SYMBOLS = [
     {'symbol': 'USDTRY=X', 'type': 'doviz', 'name': 'Dolar/TL'},
     {'symbol': 'EURTRY=X', 'type': 'doviz', 'name': 'Euro/TL'},
@@ -36,7 +37,8 @@ istanbul_tz = pytz.timezone('Europe/Istanbul')
 
 # --- Önbellekleme Ayarları ---
 CACHE_DURATION_SECONDS = 15 * 60  # 15 dakika
-cached_data = None
+# YENİ: cached_data artık 'None' değil, bir sözlük.
+cached_data = {} 
 last_successful_fetch_time = 0
 fetch_lock = threading.Lock()
 fetch_in_progress_event = threading.Event()
@@ -44,9 +46,10 @@ fetch_complete_event = threading.Event()
 stop_event = threading.Event()
 background_thread = None
 
-# --- YENİ: STATİK VERİ ÖNBELLEĞİ ---
-# Bu sözlük, hisse adları ve sektörler gibi değişmeyen verileri tutar.
-# Sadece uygulama başladığında 1 kez doldurulur.
+# YENİ: Aşamalı yükleme için chunk boyutu
+CHUNK_SIZE = 25 # 100 hisseyi 4 parçada (25'erli) çekecek
+
+# --- Statik Veri Önbelleği (Değişmeyen Ad/Sektör) ---
 STATIC_INFO_CACHE = {}
 
 # --- Borsa Saatleri Kontrolü (Değişiklik yok) ---
@@ -55,291 +58,292 @@ def is_market_open(now_istanbul):
     current_time = now_istanbul.time()
     if day_of_week >= 5: return False
     market_open_time = dt_time(10, 0)
-    market_close_time = dt_time(18, 10) # yfinance gecikmesi için tolerans
+    market_close_time = dt_time(18, 10)
     return market_open_time <= current_time <= market_close_time
 
-# --- YENİ: STATİK VERİ ÇEKME FONKSİYONU ---
-def fetch_static_company_info():
+# --- YENİ: Statik Veri Çekme Fonksiyonu (Parametreli) ---
+def fetch_static_company_info(symbols_list):
     """
-    Uygulama başlarken SADECE BİR KEZ çalışır.
-    Hisselerin adları ve sektörleri gibi değişmeyen verileri çeker.
+    Verilen 'symbols_list' için hisse adı/sektör çeker
+    ve global STATIC_INFO_CACHE'i günceller.
     """
     global STATIC_INFO_CACHE
-    if STATIC_INFO_CACHE: # Zaten doluysa tekrar çalıştırma
+    if not symbols_list:
         return
 
-    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Statik hisse bilgileri (Ad, Sektör) çekiliyor...")
+    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Statik bilgiler (Ad/Sektör) {len(symbols_list)} sembol için çekiliyor...")
     
-    if not BIST100_SYMBOLS:
-        print("BIST100 sembol listesi boş, statik veri çekilemiyor.")
-        return
-
-    symbols_str = " ".join(BIST100_SYMBOLS)
+    symbols_str = " ".join(symbols_list)
     tickers_bist = yf.Tickers(symbols_str)
-    temp_cache = {}
     failed_infos = []
 
-    for symbol in BIST100_SYMBOLS:
+    for symbol in symbols_list:
         try:
             full_info = tickers_bist.tickers[symbol].info
-            long_name = full_info.get("longName")
+            long_name = full_info.get("LongName") # Bazen 'L' büyük
+            if not long_name: long_name = full_info.get("longName")
+            
             short_name = full_info.get("shortName")
             sector = full_info.get("sector", "Diğer")
             
-            temp_cache[symbol] = {
+            STATIC_INFO_CACHE[symbol] = {
                 "name": long_name if long_name else (short_name if short_name else symbol),
                 "sector": sector.replace(' ', '-').lower() if sector else 'bilinmiyor'
             }
         except Exception as e:
             failed_infos.append(symbol)
-            temp_cache[symbol] = {
+            STATIC_INFO_CACHE[symbol] = {
                 "name": symbol,
-                "sector": "bilinmiyor",
+                "sektör": "bilinmiyor",
                 "static_error": f"Statik info alınamadı: {e}"
             }
     
-    STATIC_INFO_CACHE = temp_cache
     print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Statik bilgiler çekildi. {len(failed_infos)} hata.")
 
+# --- YENİ: Dinamik (Fiyat) Veri Çekme Fonksiyonu (Parametreli) ---
+def fetch_dynamic_price_data(symbols_list):
+    """
+    Verilen 'symbols_list' için dinamik (Fiyat/OHLCV) veri çeker.
+    Bir liste (list) döner.
+    """
+    if not symbols_list:
+        return []
 
-# --- OPTİMİZE EDİLMİŞ Ana Veri Çekme Fonksiyonu ---
-def fetch_and_cache_data():
-    global cached_data, last_successful_fetch_time
+    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Dinamik veriler (Fiyat/OHLCV) {len(symbols_list)} sembol için çekiliyor...")
+    
+    results_list = []
+    try:
+        symbols_str = " ".join(symbols_list)
+        data = yf.download(
+            symbols_str, period="2d", interval="1d",
+            group_by='ticker', progress=False, timeout=60
+        )
 
-    if fetch_in_progress_event.is_set():
-        return False # Başka bir fetch sürüyor
+        if data.empty:
+            raise Exception("yf.download 'period=2d' boş veri döndürdü.")
 
-    fetch_in_progress_event.set()
-    fetch_complete_event.clear()
-    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Dinamik veri çekme işlemi başlatılıyor...")
-    success = False
+        for symbol in symbols_list:
+            # Statik veriyi HAFİZADAN (CACHE) al
+            static_info = STATIC_INFO_CACHE.get(symbol, {"name": symbol, "sector": "bilinmiyor"})
+            
+            stock_result = {
+                "symbol": symbol,
+                "type": "hisse",
+                "name": static_info.get("name"),
+                "sector": static_info.get("sector"),
+                "price": None, "previousClose": None, "open": None,
+                "high": None, "low": None, "volume": None,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            try:
+                # 'data' DataFrame'inden verileri al
+                # yf.download bazen tek sembol için farklı, çoklu sembol için farklı formatta döner
+                stock_data = data[symbol] if len(symbols_list) > 1 else data
+                
+                if not stock_data.empty and len(stock_data) > 0:
+                    today = stock_data.iloc[-1]
+                    stock_result["price"] = today.get("Close")
+                    stock_result["open"] = today.get("Open")
+                    stock_result["high"] = today.get("High")
+                    stock_result["low"] = today.get("Low")
+                    stock_result["volume"] = today.get("Volume")
+                    stock_result["timestamp"] = today.name.isoformat()
+
+                    if len(stock_data) > 1:
+                        yesterday = stock_data.iloc[-2]
+                        stock_result["previousClose"] = yesterday.get("Close")
+                    else:
+                        stock_result["previousClose"] = today.get("Open")
+                else:
+                     stock_result["error"] = "Dinamik fiyat verisi bulunamadı."
+            except KeyError:
+                stock_result["error"] = "Hisse için 'yf.download' verisi bulunamadı (KeyError)."
+            except Exception as e:
+                stock_result["error"] = f"Hisse işlenirken hata: {e}"
+
+            results_list.append(stock_result)
+        
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Dinamik veriler işlendi.")
+        
+    except Exception as e:
+        print(f"HATA: BIST100 dinamik verileri çekilirken: {e}")
+        traceback.print_exc()
+        # Hata durumunda bile statik verilerle listeyi doldur
+        for symbol in symbols_list:
+             if not any(d['symbol'] == symbol for d in results_list):
+                static_info = STATIC_INFO_CACHE.get(symbol, {"name": symbol, "sector": "bilinmiyor"})
+                results_list.append({
+                    "symbol": symbol, "type": "hisse",
+                    "name": static_info.get("name"), "sector": static_info.get("sector"),
+                    "error": f"Dinamik veri çekme ana hatası: {e}"
+                })
+                
+    return results_list
+
+# --- YENİ: Döviz/Emtia Çekme Fonksiyonu (Ayrı) ---
+def fetch_commodities_data():
+    """Döviz ve Emtiaları çeker, liste döner."""
+    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Maden/Döviz çekiliyor...")
     new_data = []
+    commodity_symbols_list = [item['symbol'] for item in COMMODITY_FOREX_SYMBOLS]
+    
+    if not commodity_symbols_list:
+        return []
+        
+    try:
+        tickers_comm = yf.Tickers(" ".join(commodity_symbols_list))
+        for item in COMMODITY_FOREX_SYMBOLS:
+            symbol = item['symbol']
+            item_result = {"symbol": symbol, "type": item['type'], "sector": "doviz" if "doviz" in item['type'] else "maden"}
+            try:
+                info = tickers_comm.tickers[symbol].fast_info 
+                item_result.update({
+                    "name": info.get("shortName", item.get('name', symbol)),
+                    "price": info.get("lastPrice", info.get("regularMarketPrice")),
+                    "previousClose": info.get("previousClose", info.get("regularMarketPreviousClose")),
+                    "open": info.get("open", info.get("regularMarketOpen")),
+                    "high": info.get("dayHigh", info.get("regularMarketDayHigh")),
+                    "low": info.get("dayLow", info.get("regularMarketDayLow")),
+                    "volume": info.get("volume", info.get("regularMarketVolume")),
+                    "timestamp": datetime.now().isoformat()
+                })
+                if item_result["price"] is None: item_result["error"] = "Fiyat bilgisi alınamadı."
+            except Exception as e:
+                print(f"Hata ({symbol} info çekilirken): {e}")
+                item_result.update({"name": item.get('name', symbol), "error": "Veri çekilemedi."})
+            new_data.append(item_result)
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Maden/Döviz çekildi.")
+    except Exception as e:
+        print(f"HATA: Maden/Döviz verileri çekilirken: {e}")
+        traceback.print_exc()
+
+    # Sentetik Hesaplamalar
+    try:
+        usd_try_item = next((item for item in new_data if item["symbol"] == "USDTRY=X" and item.get("price")), None)
+        ons_gold_item = next((item for item in new_data if item["symbol"] == "GC=F" and item.get("price")), None)
+        ons_silver_item = next((item for item in new_data if item["symbol"] == "SI=F" and item.get("price")), None)
+        ons_platinum_item = next((item for item in new_data if item["symbol"] == "PL=F" and item.get("price")), None)
+        
+        def calculate_synthetic(ons_item, usd_item, symbol, name):
+            if usd_item and ons_item:
+                price = (ons_item["price"] / ONS_TO_GRAM_DIVISOR) * usd_item["price"]
+                prev_close = None
+                if ons_item.get("previousClose") and usd_item.get("previousClose"):
+                   prev_close = (ons_item["previousClose"] / ONS_TO_GRAM_DIVISOR) * usd_item["previousClose"]
+                return {
+                    "symbol": symbol, "type": "maden_gram", "name": name,
+                    "price": price, "previousClose": prev_close,
+                    "timestamp": datetime.now().isoformat(), "sector": "maden"
+                }
+            return None
+
+        gram_gold = calculate_synthetic(ons_gold_item, usd_try_item, "GRAMALTIN", "Gram Altın (TL)")
+        gram_silver = calculate_synthetic(ons_silver_item, usd_try_item, "GRAMGUMUS", "Gram Gümüş (TL)")
+        gram_platinum = calculate_synthetic(ons_platinum_item, usd_try_item, "GRAMPLATIN", "Gram Platin (TL)")
+        
+        if gram_gold: new_data.append(gram_gold)
+        if gram_silver: new_data.append(gram_silver)
+        if gram_platinum: new_data.append(gram_platinum)
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Sentetik gram fiyatları hesaplandı.")
+    except Exception as e:
+        print(f"HATA: Sentetik gram fiyatları hesaplanırken: {e}")
+    
+    return new_data
+
+# --- TAMAMEN YENİLENMİŞ Arka Plan Yenileme Fonksiyonu ---
+def background_refresher():
+    global cached_data, last_successful_fetch_time, fetch_in_progress_event, fetch_complete_event
+
+    print("Arka plan yenileyici başlatıldı.")
+    fetch_in_progress_event.set() # Başlangıçta fetch sürüyor
     
     try:
-        if not BIST100_SYMBOLS:
-            print("Uyarı: BIST100 sembol listesi boş, sadece maden/döviz çekilecek.")
-
-        # === 1. BIST100 HİSSELERİNİ ÇEKME (OPTİMİZE EDİLDİ) ===
-        if BIST100_SYMBOLS:
-            try:
-                symbols_str = " ".join(BIST100_SYMBOLS)
-                print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] BIST100 ({len(BIST100_SYMBOLS)} sembol) dinamik verileri (Fiyat/OHLCV) tek seferde çekiliyor...")
-                
-                # Tüm fiyat, hacim ve önceki gün kapanış verilerini TEK BİR ÇAĞRIDA al
-                # period="2d" -> son 2 günü alır. iloc[-1] = bugün, iloc[-2] = dün (previousClose)
-                data = yf.download(
-                    symbols_str, period="2d", interval="1d",
-                    group_by='ticker', progress=False, timeout=60
-                )
-                print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Dinamik veriler çekildi.")
-
-                if data.empty:
-                    raise Exception("yf.download 'period=2d' boş veri döndürdü.")
-
-                # Çekilen veriyi işle
-                for symbol in BIST100_SYMBOLS:
-                    # Statik veriyi (Ad, Sektör) HAFİZADAN (CACHE) al
-                    static_info = STATIC_INFO_CACHE.get(symbol, {"name": symbol, "sector": "bilinmiyor"})
-                    
-                    stock_result = {
-                        "symbol": symbol,
-                        "type": "hisse",
-                        "name": static_info.get("name"),
-                        "sector": static_info.get("sector"),
-                        "price": None,
-                        "previousClose": None,
-                        "open": None,
-                        "high": None,
-                        "low": None,
-                        "volume": None,
-                        "timestamp": datetime.now().isoformat()
-                    }
-
-                    try:
-                        # 'data' DataFrame'inden verileri al
-                        stock_data = data[symbol]
-                        if not stock_data.empty and len(stock_data) > 0:
-                            # Son gün (bugün) verileri
-                            today = stock_data.iloc[-1]
-                            stock_result["price"] = today.get("Close")
-                            stock_result["open"] = today.get("Open")
-                            stock_result["high"] = today.get("High")
-                            stock_result["low"] = today.get("Low")
-                            stock_result["volume"] = today.get("Volume")
-                            stock_result["timestamp"] = today.name.isoformat()
-
-                            # Önceki gün (dün) kapanışı
-                            if len(stock_data) > 1:
-                                yesterday = stock_data.iloc[-2]
-                                stock_result["previousClose"] = yesterday.get("Close")
-                            else:
-                                # Sadece 1 gün veri varsa (örn: yeni halka arz)
-                                stock_result["previousClose"] = today.get("Open") # Fallback
-                        
-                        else:
-                             stock_result["error"] = "Dinamik fiyat verisi bulunamadı."
-
-                    except KeyError:
-                        stock_result["error"] = "Hisse için 'yf.download' verisi bulunamadı (KeyError)."
-                    except Exception as e:
-                        stock_result["error"] = f"Hisse işlenirken hata: {e}"
-
-                    new_data.append(stock_result)
-                
-                print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] BIST100 dinamik verileri işlendi.")
-            
-            except Exception as e:
-                print(f"HATA: BIST100 dinamik verileri çekilirken: {e}")
-                traceback.print_exc()
-
-        # === 2. MADEN VE DÖVİZ KURLARINI ÇEKME (Değişiklik yok, zaten hızlıydı) ===
-        commodity_symbols_list = [item['symbol'] for item in COMMODITY_FOREX_SYMBOLS]
+        # --- 1. AŞAMA: Başlangıç Yüklemesi (Aşamalı) ---
+        print("Başlangıç yüklemesi (Aşamalı) başlıyor...")
         
-        if commodity_symbols_list:
-            try:
-                print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Maden/Döviz ({len(commodity_symbols_list)} sembol) çekiliyor...")
-                tickers_comm = yf.Tickers(" ".join(commodity_symbols_list))
-                
-                for item in COMMODITY_FOREX_SYMBOLS:
-                    symbol = item['symbol']
-                    item_result = {
-                        "symbol": symbol,
-                        "type": item['type'],
-                        "sector": "doviz" if "doviz" in item['type'] else "maden"
-                    }
-                    try:
-                        info = tickers_comm.tickers[symbol].fast_info 
-                        item_result["name"] = info.get("shortName", item.get('name', symbol))
-                        item_result["price"] = info.get("lastPrice", info.get("regularMarketPrice"))
-                        item_result["previousClose"] = info.get("previousClose", info.get("regularMarketPreviousClose"))
-                        item_result["open"] = info.get("open", info.get("regularMarketOpen"))
-                        item_result["high"] = info.get("dayHigh", info.get("regularMarketDayHigh"))
-                        item_result["low"] = info.get("dayLow", info.get("regularMarketDayLow"))
-                        item_result["volume"] = info.get("volume", info.get("regularMarketVolume"))
-                        item_result["timestamp"] = datetime.now().isoformat()
-                        
-                        if item_result["price"] is None:
-                            item_result["error"] = "Fiyat bilgisi alınamadı."
-                            
-                        new_data.append(item_result)
-                    
-                    except Exception as e:
-                        print(f"Hata ({symbol} info çekilirken): {e}")
-                        item_result["name"] = item.get('name', symbol)
-                        item_result["error"] = "Veri çekilemedi."
-                        new_data.append(item_result)
-                print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Maden/Döviz çekildi.")
-
-            except Exception as e:
-                print(f"HATA: Maden/Döviz verileri çekilirken: {e}")
-                traceback.print_exc()
-
-        # === 3. SENTETİK HESAPLAMALAR (Değişiklik yok) ===
-        try:
-            usd_try_item = next((item for item in new_data if item["symbol"] == "USDTRY=X" and item.get("price")), None)
-            ons_gold_item = next((item for item in new_data if item["symbol"] == "GC=F" and item.get("price")), None)
-            ons_silver_item = next((item for item in new_data if item["symbol"] == "SI=F" and item.get("price")), None)
-            ons_platinum_item = next((item for item in new_data if item["symbol"] == "PL=F" and item.get("price")), None)
-            
-            if usd_try_item and ons_gold_item:
-                gram_gold_price = (ons_gold_item["price"] / ONS_TO_GRAM_DIVISOR) * usd_try_item["price"]
-                gram_gold_prev_close = None
-                if ons_gold_item.get("previousClose") and usd_try_item.get("previousClose"):
-                   gram_gold_prev_close = (ons_gold_item["previousClose"] / ONS_TO_GRAM_DIVISOR) * usd_try_item["previousClose"]
-                new_data.append({
-                    "symbol": "GRAMALTIN", "type": "maden_gram", "name": "Gram Altın (TL)",
-                    "price": gram_gold_price, "previousClose": gram_gold_prev_close,
-                    "timestamp": datetime.now().isoformat(), "sector": "maden"
-                })
-            
-            if usd_try_item and ons_silver_item:
-                gram_silver_price = (ons_silver_item["price"] / ONS_TO_GRAM_DIVISOR) * usd_try_item["price"]
-                gram_silver_prev_close = None
-                if ons_silver_item.get("previousClose") and usd_try_item.get("previousClose"):
-                   gram_silver_prev_close = (ons_silver_item["previousClose"] / ONS_TO_GRAM_DIVISOR) * usd_try_item["previousClose"]
-                new_data.append({
-                    "symbol": "GRAMGUMUS", "type": "maden_gram", "name": "Gram Gümüş (TL)",
-                    "price": gram_silver_price, "previousClose": gram_silver_prev_close,
-                    "timestamp": datetime.now().isoformat(), "sector": "maden"
-                })
-
-            if usd_try_item and ons_platinum_item:
-                gram_platinum_price = (ons_platinum_item["price"] / ONS_TO_GRAM_DIVISOR) * usd_try_item["price"]
-                gram_platinum_prev_close = None
-                if ons_platinum_item.get("previousClose") and usd_try_item.get("previousClose"):
-                   gram_platinum_prev_close = (ons_platinum_item["previousClose"] / ONS_TO_GRAM_DIVISOR) * usd_try_item["previousClose"]
-                new_data.append({
-                    "symbol": "GRAMPLATIN", "type": "maden_gram", "name": "Gram Platin (TL)",
-                    "price": gram_platinum_price, "previousClose": gram_platinum_prev_close,
-                    "timestamp": datetime.now().isoformat(), "sector": "maden"
-                })
-            print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Sentetik gram fiyatları hesaplandı.")
-        except Exception as e:
-            print(f"HATA: Sentetik gram fiyatları hesaplanırken: {e}")
-            traceback.print_exc()
-
-        # === 4. ÖNBELLEĞİ GÜNCELLEME ===
+        # BIST100 listesini chunk'lara böl
+        symbol_chunks = np.array_split(BIST100_SYMBOLS, CHUNK_SIZE)
+        
+        # İlk Döviz/Emtia çekimi
+        commodity_data = fetch_commodities_data()
         with fetch_lock:
-            cached_data = new_data
-            last_successful_fetch_time = time.time()
-        success = True
-        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Önbellek güncellendi. Toplam {len(new_data)} varlık.")
+            for item in commodity_data:
+                cached_data[item['symbol']] = item
+        print(f"İlk Döviz/Emtia verisi yüklendi ({len(commodity_data)} varlık).")
+        
+        # BIST100 chunk'larını SIRA İLE işle
+        for i, chunk in enumerate(symbol_chunks):
+            chunk_list = chunk.tolist()
+            print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] AŞAMA {i+1}/{len(symbol_chunks)} ({len(chunk_list)} sembol) başlıyor...")
+            
+            # 1. Statik veriyi (Ad/Sektör) çek
+            fetch_static_company_info(chunk_list)
+            
+            # 2. Dinamik veriyi (Fiyat) çek
+            dynamic_data = fetch_dynamic_price_data(chunk_list)
+            
+            # 3. Önbelleği güncelle
+            with fetch_lock:
+                for item in dynamic_data:
+                    cached_data[item['symbol']] = item # Sözlüğe ekle/güncelle
+            
+            print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] AŞAMA {i+1} tamamlandı. Önbellekte {len(cached_data)} varlık var.")
+            
+            if i == 0:
+                # İLK AŞAMA BİTTİĞİNDE API'yi aç
+                last_successful_fetch_time = time.time()
+                fetch_in_progress_event.clear() # Fetch bitti (ilk chunk için)
+                fetch_complete_event.set() # API'ye "veri hazır" sinyali gönder
+                print(f"İLK AŞAMA tamamlandı. API 'veri hazır' sinyali aldı.")
+            
+            time.sleep(5) # yfinance rate limit için 5 saniye bekle
 
+        print("Tüm aşamalı yükleme tamamlandı.")
+        last_successful_fetch_time = time.time()
+        
     except Exception as e:
-        print(f"Hata: Ana veri çekme işlemi başarısız: {e}")
-        print(traceback.format_exc())
-        success = False
-    finally:
-        fetch_in_progress_event.clear()
-        fetch_complete_event.set()
-        return success
+        print(f"HATA: Başlangıç yüklemesi başarısız: {e}")
+        traceback.print_exc()
+        fetch_in_progress_event.clear() # Hata durumunda da API'yi aç
+        fetch_complete_event.set() # Boş da olsa veri sunsun
 
-# --- GÜNCELLENMİŞ Arka Plan Yenileme Thread Fonksiyonu ---
-def background_refresher():
-    global last_successful_fetch_time
-    
-    print("Arka plan yenileyici başlatıldı.")
-    
-    # 1. Adım: YAVAŞ olan statik veri çekmeyi KENDİ THREAD'İNDE başlat
-    # Bu, ana arka plan döngüsünü ENGELLEMEZ.
-    print("Statik hisse bilgileri (Ad, Sektör) için ayrı bir thread başlatılıyor...")
-    static_thread = threading.Thread(target=fetch_static_company_info, daemon=True)
-    static_thread.start()
-    
-    # 2. Adım: HIZLI olan ilk dinamik veriyi HEMEN ÇEK
-    # Bu, 'cached_data'yı hızlıca doldurur (isim/sektör olmadan)
-    # API bu sayede 503 hatası vermez, sadece ilk veride isim/sektör eksik olur.
-    print("İlk dinamik veri çekme işlemi başlatılıyor (API'yi hızlıca doldurmak için)...")
-    fetch_and_cache_data()
-    print("İlk dinamik veri çekme işlemi tamamlandı. API artık 'kısmen' hazır.")
-
-    # 3. Adım: Normal 15 dakikalık döngüye gir
+    # --- 2. AŞAMA: Normal Yenileme Döngüsü (15 Dk'da bir) ---
+    print("Normal yenileme döngüsü (15dk) başlıyor...")
     while not stop_event.is_set():
         try:
+            # 15 dakika (veya piyasa kapalıysa daha uzun) bekle
             now_istanbul = datetime.now(istanbul_tz)
-            market_open = is_market_open(now_istanbul)
-            cache_age = time.time() - last_successful_fetch_time
+            wait_time = 60 # Varsayılan kontrol 60sn
             
-            # Piyasa açıksa ve önbellek 15 dakikadan eskiyse YENİLE
-            if market_open and cache_age > CACHE_DURATION_SECONDS:
-                if not fetch_in_progress_event.is_set():
-                     print(f"[{now_istanbul.strftime('%H:%M:%S')}] [BG] Zaman aşımı, dinamik veri çekme başlatılıyor...")
-                     fetch_and_cache_data() # Bu, static_thread bittiyse artık isim/sektörleri de alacak
+            if is_market_open(now_istanbul):
+                if time.time() - last_successful_fetch_time > CACHE_DURATION_SECONDS:
+                    print(f"[{now_istanbul.strftime('%H:%M:%S')}] [BG] Zaman aşımı, tam yenileme başlıyor...")
+                    fetch_in_progress_event.set()
+                    
+                    # TAM yenileme (Artık hepsi tek seferde)
+                    fetch_static_company_info(BIST100_SYMBOLS)
+                    dynamic_data = fetch_dynamic_price_data(BIST100_SYMBOLS)
+                    commodity_data = fetch_commodities_data()
+                    
+                    with fetch_lock:
+                        cached_data.clear() # Eski verileri temizle
+                        for item in (dynamic_data + commodity_data):
+                            cached_data[item['symbol']] = item
+                    
+                    last_successful_fetch_time = time.time()
+                    fetch_in_progress_event.clear()
+                    print(f"[{now_istanbul.strftime('%H:%M:%S')}] [BG] Tam yenileme tamamlandı. {len(cached_data)} varlık.")
             
-            # Piyasa kapalıysa ve önbellek 1 saatten eskiyse YENİLE (kapanış verilerini almak için)
-            elif not market_open and cache_age > 3600: 
-                 if not fetch_in_progress_event.is_set():
-                     print(f"[{now_istanbul.strftime('%H:%M:%S')}] [BG] Piyasa kapalı, kapanış verileri için yenileme...")
-                     fetch_and_cache_data()
-                     
-            stop_event.wait(60) # 1 dakika bekle
+            stop_event.wait(wait_time) # 60 saniye bekle
+            
         except Exception as e:
             print(f"Arka plan yenileyici hatası: {e}")
-            print(traceback.format_exc())
+            traceback.print_exc()
             stop_event.wait(300) # Hata durumunda 5dk bekle
 
 
-# --- Flask Endpoint: BIST100 (Değişiklik yok) ---
+# --- Flask Endpoint: BIST100 (Endeks) (Değişiklik yok) ---
 @app.route('/api/bist100')
 def get_bist100_index():
     try:
@@ -364,51 +368,44 @@ def get_bist100_index():
         return jsonify({"error": "Endeks verisi çekilemedi.", "symbol": "XU100.IS", "shortName": "BIST 100", "price": None}), 500
 
 
-# --- Flask Endpoint: BIST100/COMPANIES (Değişiklik yok, mantık hala geçerli) ---
-# Bu endpoint artık HİÇBİR ZAMAN veri çekme işlemini tetiklemeyecek,
-# sadece arka plan thread'inin işini bitirmesini bekleyecek (eğer ilk istekse).
+# --- Flask Endpoint: BIST100/COMPANIES (TÜM VERİLER - AŞAMALI YÜKLEME) ---
 @app.route('/api/bist100/companies')
 def get_bist100_companies():
     global cached_data, last_successful_fetch_time
 
     now_istanbul = datetime.now(istanbul_tz)
 
-    # 1. Önbellek var mı? Varsa doğrudan sun.
-    if cached_data is not None:
-        return jsonify(cached_data)
+    # 1. Önbellek dolu mu? (Artık {} değil, dolu mu diye bak)
+    if cached_data:
+        # Önbellek bir sözlük, biz liste dönmeliyiz
+        return jsonify(list(cached_data.values()))
 
-    # 2. Önbellek yok (muhtemelen ilk istek). Fetch işlemi sürüyor mu?
-    print(f"[{now_istanbul.strftime('%H:%M:%S')}] Önbellek boş. İlk veri çekme işlemi kontrol ediliyor...")
+    # 2. Önbellek boş. Başlangıç yüklemesi (ilk chunk) sürüyor mu?
+    print(f"[{now_istanbul.strftime('%H:%M:%S')}] Önbellek boş. İlk aşamanın tamamlanması bekleniyor...")
 
     if fetch_in_progress_event.is_set():
-        print(f"[{now_istanbul.strftime('%H:%M:%S')}] İlk fetch işlemi sürüyor. Tamamlanması bekleniyor (max 60s)...")
-        completed = fetch_complete_event.wait(timeout=60)
+        # İlk chunk'ın bitmesini 60sn bekle
+        completed = fetch_complete_event.wait(timeout=60) 
         
         if completed and cached_data:
-            print(f"[{now_istanbul.strftime('%H:%M:%S')}] İlk fetch tamamlandı, veri sunuluyor.")
-            return jsonify(cached_data)
+            print(f"[{now_istanbul.strftime('%H:%M:%S')}] İlk aşama tamamlandı, veri sunuluyor.")
+            return jsonify(list(cached_data.values()))
         elif completed and not cached_data:
             return jsonify({"error": "Veri çekme işlemi tamamlandı ancak önbellek boş."}), 500
         else: # Timeout
-            print(f"[{now_istanbul.strftime('%H:%M:%S')}] Fetch bekleme zaman aşımına uğradı.")
+            print(f"[{now_istanbul.strftime('%H:%M:%S')}] Fetch bekleme zaman aşımına uğradı (60s).")
             return jsonify({"error": "Veri çekme işlemi zaman aşımına uğradı."}), 504
     else:
-        # Bu durumun normalde olmaması gerekir (thread'in başlamaması)
+        # Bu durum, thread'in çökmesi halinde olabilir
         print(f"[{now_istanbul.strftime('%H:%M:%S')}] HATA: Önbellek boş ve fetch işlemi sürmüyor.")
         return jsonify({"error": "Sunucu başlatılıyor, lütfen birkaç saniye sonra tekrar deneyin."}), 503
 
 # --- Uygulama Başlangıcı ---
-# Gunicorn kullanırken 'if __name__ == "__main__":' bloğu ÇALIŞMAZ.
-# Kodun doğrudan bu seviyede (global scope) olması gerekir.
-
 print("Flask uygulaması başlatılıyor...")
 
 if not os.environ.get("WERKZEUG_RUN_MAIN"):
-     print("Arka plan thread başlatılıyor...")
-     # NOT: Statik veri çekme artık 'background_refresher' İÇİNDE
+     print("Arka plan thread başlatılıyor (Aşamalı Yükleme)...")
      background_thread = threading.Thread(target=background_refresher, daemon=True)
      background_thread.start()
 
-# 'app.run()' Gunicorn tarafından yönetildiği için burada olmamalı.
-# Gunicorn 'app:app' nesnesini bulup kendisi çalıştırır.
 print(f"Flask uygulaması Gunicorn tarafından yönetilmeye hazır. (PID: {os.getpid()})")
