@@ -94,16 +94,13 @@ def fetch_and_cache_data():
                     stock_result = {"symbol": symbol, "type": "hisse"}
                     
                     # --- BÖLÜM 1: INFO (İSİM, FİYAT, SEKTÖR) ---
-                    # --- DEĞİŞİKLİK 1: .info yerine .fast_info kullanıldı (Daha hızlı) ---
                     try:
-                        # .info yerine .fast_info (çok daha hızlıdır ve daha az bellek kullanır)
-                        f_info = tickers_bist.tickers[symbol].fast_info
-                        
-                        p_close = f_info.get("previousClose")
-                        current_price = f_info.get("lastPrice") # .fast_info 'lastPrice' kullanır
-                        long_name = f_info.get("longName")
-                        short_name = f_info.get("shortName")
-                        sector = f_info.get("sector", "Diğer")
+                        full_info = tickers_bist.tickers[symbol].info
+                        p_close = full_info.get("regularMarketPreviousClose")
+                        current_price = full_info.get("regularMarketPrice") # Güncel fiyat
+                        long_name = full_info.get("longName")
+                        short_name = full_info.get("shortName")
+                        sector = full_info.get("sector", "Diğer")
                         
                         stock_result["name"] = long_name if long_name else (short_name if short_name else symbol)
                         stock_result["previousClose"] = p_close
@@ -112,17 +109,15 @@ def fetch_and_cache_data():
                         
                         # Info'dan fiyat gelmezse hata olarak işaretle
                         if current_price is None:
-                            stock_result["error"] = "fast_info: Fiyat alınamadı."
+                            stock_result["error"] = "Info: Fiyat alınamadı."
 
                     except Exception as info_err:
-                        # .fast_info çekilemezse (rate limit, vb.)
+                        # .info çekilemezse (rate limit, vb.)
                         failed_infos_bist.append(symbol)
                         stock_result["name"] = symbol
                         stock_result["sector"] = "bilinmiyor"
-                        stock_result["error"] = "fast_info verisi alınamadı."
+                        stock_result["error"] = "Info verisi alınamadı."
                         # print(f"[{symbol}] Info hatası: {info_err}") # Debug
-                    # --- DEĞİŞİKLİK 1 BİTTİ ---
-
 
                     # --- BÖLÜM 2: OHLCV (OPEN, HIGH, LOW, VOLUME) ---
                     stock_ohlcv = None
@@ -151,9 +146,11 @@ def fetch_and_cache_data():
                                      stock_result["warning"] = "Fiyat dünkü kapanış verisidir."
                     
                     except KeyError as ke:
+                        # Bu normal bir durum, OHLCV verisi bulunamadı demektir. Hata basma.
+                        # print(f"[{symbol}] OHLCV verisi bulunamadı (KeyError).")
                         pass 
                     except Exception as e:
-                        print(f"Hata ({symbol} OHLCV işlenirken): {e}")
+                        print(f"Hata ({symbol} OHLCV işlenirken): {e}") # Sadece beklenmedik hataları bas
                 
                     # --- BÖLÜM 3: SON KONTROL ---
                     if stock_result.get("price") is None and not stock_result.get("error"):
@@ -162,7 +159,7 @@ def fetch_and_cache_data():
                     new_data.append(stock_result)
                 
                 info_fetch_duration = time.time() - info_fetch_start
-                print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] BIST100 .fast_info çekme süresi: {info_fetch_duration:.2f}s.")
+                print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] BIST100 .info çekme süresi: {info_fetch_duration:.2f}s.")
                 print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] BIST100 çekildi. {len(failed_infos_bist)} info hatası.")
             
             except Exception as e:
@@ -312,41 +309,52 @@ def get_bist100_index():
         print(f"yfinance hatası (XU100.IS): {e}")
         return jsonify({"error": "Endeks verisi çekilemedi.", "symbol": "XU100.IS", "shortName": "BIST 100", "price": None}), 500
 
-
-# --- DEĞİŞİKLİK 2: /api/bist100/companies ENDPOINT'İ YENİDEN YAZILDI ---
+# --- Flask Endpoint: /api/bist100/companies (OverflowError Düzeltilmiş) ---
 @app.route('/api/bist100/companies')
 def get_bist100_companies():
-    global cached_data
+    global cached_data, last_successful_fetch_time
 
+    now = time.time()
     now_istanbul = datetime.now(istanbul_tz)
+    market_open = is_market_open(now_istanbul)
+    cache_age = now - last_successful_fetch_time if last_successful_fetch_time > 0 else float('inf')
 
-    # 1. Önbellek dolu mu? (Eski bile olsa)
     if cached_data is not None:
-        # Önbellek doluysa, eski bile olsa HEMEN sun.
-        # Arka plan thread'i zaten eskiyse yenileyecektir (background_refresher logic).
-        # Bu, "stale-while-revalidate" desenidir ve timeout'u engeller.
-        # print(f"[{now_istanbul.strftime('%H:%M:%S')}] Önbellek dolu, sunuluyor.") # Debug için
-        return jsonify(cached_data)
+        if not market_open or (market_open and cache_age < CACHE_DURATION_SECONDS):
+            return jsonify(cached_data)
 
-    # 2. Önbellek boşsa (uygulama yeni başladı ve ilk fetch sürüyor)
+    # === HATA DÜZELTMESİ (OverflowError) ===
+    cache_age_str = f"{int(cache_age)}s" if cache_age != float('inf') else "henüz yok"
+    print(f"[{now_istanbul.strftime('%H:%M:%S')}] Önbellek geçersiz veya {cache_age_str}. Durum kontrol ediliyor...")
+    # === DÜZELTME SONU ===
+
     if fetch_in_progress_event.is_set():
-        # İlk veri çekme işlemi hala sürüyorsa, istemciye beklemesini söyle.
-        # ASLA burada bekleme (wait()) veya fetch'i kendin çağırma!
-        print(f"[{now_istanbul.strftime('%H:%M:%S')}] Önbellek boş, ilk fetch sürüyor. 503 döndürülüyor.")
-        return jsonify({
-            "error": "Veriler sunucu tarafından ilk kez yükleniyor. Lütfen 1-2 dakika sonra tekrar deneyin.",
-            "status": "LOADING"
-        }), 503 # 503 Service Unavailable (Sunucu geçici olarak meşgul)
-
-    # 3. Önbellek boş ve fetch işlemi de sürmüyorsa (İstenmeyen durum)
-    # Bu, arka plan thread'in başlamadan çökmesi gibi bir durumu gösterir.
-    print(f"[{now_istanbul.strftime('%H:%M:%S')}] HATA: Önbellek boş ve fetch işlemi çalışmıyor.")
-    return jsonify({
-        "error": "Sunucu hatası: Veri yükleyici çalışmıyor ve önbellek boş.",
-        "status": "ERROR"
-    }), 500 # 500 Internal Server Error
-# --- DEĞİŞİKLİK 2 BİTTİ ---
-
+        print(f"[{now_istanbul.strftime('%H:%M:%S')}] Fetch işlemi sürüyor. Tamamlanması bekleniyor (max 60s)...")
+        completed = fetch_complete_event.wait(timeout=60)
+        if completed:
+            print(f"[{now_istanbul.strftime('%H:%M:%S')}] Bekleme sonrası önbellek durumu kontrol ediliyor.")
+            if cached_data:
+                return jsonify(cached_data)
+            else:
+                return jsonify({"error": "Veri çekme işlemi beklenirken başarısız oldu."}), 500
+        else: # Timeout
+            print(f"[{now_istanbul.strftime('%H:%M:%S')}] Fetch bekleme zaman aşımına uğradı.")
+            if cached_data:
+                 print(f"[{now_istanbul.strftime('%H:%M:%S')}] Zaman aşımı sonrası eski önbellek sunuluyor.")
+                 return jsonify(cached_data)
+            else:
+                 return jsonify({"error": "Veri çekme işlemi zaman aşımına uğradı."}), 504
+    else:
+        print(f"[{now_istanbul.strftime('%H:%M:%S')}] Yeni fetch işlemi tetikleniyor...")
+        success = fetch_and_cache_data()
+        if success and cached_data:
+            return jsonify(cached_data)
+        else:
+            if cached_data:
+                 print(f"[{now_istanbul.strftime('%H:%M:%S')}] Senkron fetch başarısız, eski önbellek sunuluyor.")
+                 return jsonify(cached_data)
+            else:
+                 return jsonify({"error": "Veri çekilemedi ve önbellek boş."}), 500
 
 # --- Uygulama Başlangıcı ---
 if __name__ == '__main__':
@@ -362,6 +370,5 @@ if __name__ == '__main__':
          background_thread = threading.Thread(target=background_refresher, daemon=True)
          background_thread.start()
     
-    # Portu 5000 olarak ayarla (frontend 3000'de)
     print(f"Flask sunucusu http://127.0.0.1:5000 adresinde başlatılıyor... (PID: {os.getpid()})")
     app.run(debug=True, port=5000)
