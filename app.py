@@ -36,7 +36,6 @@ CORS(app)
 istanbul_tz = pytz.timezone('Europe/Istanbul')
 
 # --- Önbellekleme Ayarları (GLOBAL DEĞİŞKENLER) ---
-# --workers 1 sayesinde bu değişkenler tüm thread'ler arasında paylaşılacak
 CACHE_DURATION_SECONDS = 15 * 60  # 15 dakika
 cached_data = {} # Sözlük olarak başlat
 last_successful_fetch_time = 0
@@ -48,9 +47,7 @@ background_thread = None
 
 # Aşamalı yükleme için (25'erli gruplar)
 CHUNK_SIZE = 25 
-
-# Statik Veri Önbelleği (Değişmeyen Ad/Sektör)
-STATIC_INFO_CACHE = {}
+STATIC_INFO_CACHE = {} # Statik (Ad/Sektör) verisi için
 
 # --- Borsa Saatleri Kontrolü ---
 def is_market_open(now_istanbul):
@@ -61,8 +58,12 @@ def is_market_open(now_istanbul):
     market_close_time = dt_time(18, 10)
     return market_open_time <= current_time <= market_close_time
 
-# --- Statik Veri Çekme Fonksiyonu (Ad/Sektör) ---
+# --- Statik Veri Çekme Fonksiyonu (Ad/Sektör - YAVAŞ) ---
 def fetch_static_company_info(symbols_list):
+    """
+    Verilen 'symbols_list' için hisse adı/sektör çeker
+    ve global STATIC_INFO_CACHE'i günceller.
+    """
     global STATIC_INFO_CACHE
     if not symbols_list: return
 
@@ -83,11 +84,22 @@ def fetch_static_company_info(symbols_list):
             }
         except Exception:
             failed_infos += 1
-            STATIC_INFO_CACHE[symbol] = {"name": symbol, "sector": "bilinmiyor"}
-    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Statik bilgiler çekildi. {failed_infos} hata.")
+            if symbol not in STATIC_INFO_CACHE:
+                STATIC_INFO_CACHE[symbol] = {"name": symbol, "sector": "bilinmiyor"}
+    
+    # Statik veriyi ana önbelleğe (cached_data) işle
+    with fetch_lock:
+        for symbol, info in STATIC_INFO_CACHE.items():
+            if symbol in cached_data:
+                cached_data[symbol].update(info)
+                
+    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Statik bilgiler çekildi ve önbelleğe işlendi. {failed_infos} hata.")
 
-# --- Dinamik Veri Çekme Fonksiyonu (Fiyat/OHLCV) ---
+# --- Dinamik Veri Çekme Fonksiyonu (Fiyat/OHLCV - HIZLI) ---
 def fetch_dynamic_price_data(symbols_list):
+    """
+    Verilen 'symbols_list' için HIZLI fiyat verisi çeker.
+    """
     if not symbols_list: return []
 
     print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Dinamik veriler (Fiyat/OHLCV) {len(symbols_list)} sembol için çekiliyor...")
@@ -100,6 +112,7 @@ def fetch_dynamic_price_data(symbols_list):
         if data.empty: raise Exception("yf.download 'period=2d' boş veri döndürdü.")
 
         for symbol in symbols_list:
+            # Başlangıçta STATIC_INFO_CACHE boş olacak, bu normal.
             static_info = STATIC_INFO_CACHE.get(symbol, {"name": symbol, "sector": "bilinmiyor"})
             stock_result = {"symbol": symbol, "type": "hisse", **static_info}
             
@@ -129,8 +142,11 @@ def fetch_dynamic_price_data(symbols_list):
              results_list.append({"symbol": symbol, "type": "hisse", **static_info, "error": f"Dinamik veri çekme hatası: {e}"})
     return results_list
 
-# --- Döviz/Emtia Çekme Fonksiyonu (Güvenilir) ---
+# --- Döviz/Emtia Çekme Fonksiyonu (HIZLI) ---
 def fetch_commodities_data():
+    """
+    Döviz ve Emtiaları HIZLI çeker (yf.download ile).
+    """
     print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Maden/Döviz (yf.download ile) çekiliyor...")
     new_data = []
     symbol_map = {item['symbol']: item for item in COMMODITY_FOREX_SYMBOLS}
@@ -203,59 +219,70 @@ def fetch_commodities_data():
         print(f"HATA: Sentetik gram fiyatları hesaplanırken: {e}")
     return new_data
 
-# --- Arka Plan Yenileme Fonksiyonu (DÜZELTİLMİŞ) ---
+# --- Arka Planda Yavaş Statik Veri Çekici ---
+def slow_static_data_populator():
+    """
+    API açıldıktan SONRA çalışır. Yavaş yavaş
+    hisse adı/sektör bilgilerini çeker ve önbelleği günceller.
+    """
+    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] [YAVAŞ THREAD] Başlatıldı. Hisse adı/sektör verisi çekilecek...")
+    time.sleep(10) # Ana thread'in bitirmesine izin ver
+    
+    # 100 hisseyi 25'erli 4 gruba böl
+    num_chunks = max(1, len(BIST100_SYMBOLS) // CHUNK_SIZE) 
+    symbol_chunks = np.array_split(BIST100_SYMBOLS, num_chunks)
+        
+    for i, chunk in enumerate(symbol_chunks):
+        chunk_list = chunk.tolist()
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] [YAVAŞ THREAD] Statik AŞAMA {i+1}/{len(symbol_chunks)} ({len(chunk_list)} sembol) başlıyor...")
+        
+        fetch_static_company_info(chunk_list) # Bu, hem STATIC_INFO_CACHE'i hem de cached_data'yı günceller
+        
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] [YAVAŞ THREAD] Statik AŞAMA {i+1} tamamlandı.")
+        time.sleep(5) # Rate limit için bekle
+
+    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] [YAVAŞ THREAD] Tüm statik veriler çekildi.")
+    
+# --- Ana Arka Plan Yenileme Fonksiyonu (NİHAİ) ---
 def background_refresher():
     global cached_data, last_successful_fetch_time, fetch_in_progress_event, fetch_complete_event
 
-    print("Arka plan yenileyici başlatıldı.")
+    print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Arka plan yenileyici başlatıldı (PID: {os.getpid()}).")
     fetch_in_progress_event.set() # Başlangıçta fetch sürüyor
     
     try:
-        # --- 1. AŞAMA: Başlangıç Yüklemesi (Aşamalı) ---
-        print("Başlangıç yüklemesi (Aşamalı) başlıyor...")
+        # --- 1. AŞAMA: HIZLI YÜKLEME (SADECE FİYATLAR) ---
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] HIZLI YÜKLEME (Fiyatlar) başlıyor...")
         
-        # 1. Önce Döviz/Emtia çek (Hızlı ve Güvenilir)
+        # 1. Döviz/Emtia çek (Hızlı)
         commodity_data = fetch_commodities_data()
         with fetch_lock:
             for item in commodity_data:
                 cached_data[item['symbol']] = item
-        print(f"İlk Döviz/Emtia verisi yüklendi ({len(commodity_data)} varlık).")
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] Döviz/Emtia verisi yüklendi ({len(commodity_data)} varlık).")
         
-        # 2. BIST100 listesini chunk'lara böl
-        # DÜZELTME: 100 // 25 = 4 chunk. Bu, 4 aşama (her biri 25 sembol) oluşturur.
-        num_chunks = max(1, len(BIST100_SYMBOLS) // CHUNK_SIZE) 
-        symbol_chunks = np.array_split(BIST100_SYMBOLS, num_chunks)
+        # 2. BIST100 Fiyatlarını çek (Hızlı)
+        # (Statik veri olmadan, sadece fiyatlar)
+        dynamic_data = fetch_dynamic_price_data(BIST100_SYMBOLS)
+        with fetch_lock:
+            for item in dynamic_data:
+                cached_data[item['symbol']] = item
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] BIST100 fiyat verisi yüklendi ({len(dynamic_data)} varlık).")
         
-        # 3. BIST100 chunk'larını SIRA İLE işle
-        for i, chunk in enumerate(symbol_chunks):
-            chunk_list = chunk.tolist()
-            print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] BIST100 AŞAMA {i+1}/{len(symbol_chunks)} ({len(chunk_list)} sembol) başlıyor...")
-            
-            fetch_static_company_info(chunk_list)
-            dynamic_data = fetch_dynamic_price_data(chunk_list)
-            
-            with fetch_lock:
-                for item in dynamic_data:
-                    cached_data[item['symbol']] = item
-            
-            print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] AŞAMA {i+1} tamamlandı. Önbellekte {len(cached_data)} varlık var.")
-            
-            if i == 0:
-                # İLK AŞAMA (Döviz + 25 hisse) BİTTİĞİNDE API'yi aç
-                last_successful_fetch_time = time.time()
-                fetch_in_progress_event.clear() # Fetch bitti
-                fetch_complete_event.set() # API'ye "veri hazır" sinyali gönder
-                print(f"İLK AŞAMA tamamlandı. API 'veri hazır' sinyali aldı.")
-            
-            time.sleep(2) # yfinance rate limit için bekle
-
-        print("Tüm aşamalı yükleme tamamlandı.")
+        # 3. API'yi AÇ
         last_successful_fetch_time = time.time()
+        fetch_in_progress_event.clear() # Fetch bitti
+        fetch_complete_event.set() # API'ye "veri hazır" sinyali gönder
+        print(f"[{datetime.now(istanbul_tz).strftime('%H:%M:%S')}] HIZLI YÜKLEME tamamlandı. API 'veri hazır' sinyali aldı. Önbellekte {len(cached_data)} varlık var.")
+        
+        # 4. YAVAŞ THREAD'i başlat (Ad/Sektör verisi için)
+        static_loader_thread = threading.Thread(target=slow_static_data_populator, daemon=True)
+        static_loader_thread.start()
         
     except Exception as e:
-        print(f"HATA: Başlangıç yüklemesi başarısız: {e}")
+        print(f"HATA: Hızlı yükleme başarısız: {e}")
         traceback.print_exc()
-        fetch_in_progress_event.clear() # Hata durumunda da API'yi aç
+        fetch_in_progress_event.clear()
         fetch_complete_event.set()
 
     # --- 2. AŞAMA: Normal Yenileme Döngüsü (15 Dk'da bir) ---
@@ -263,7 +290,7 @@ def background_refresher():
     while not stop_event.is_set():
         try:
             now_istanbul = datetime.now(istanbul_tz)
-            wait_time = 60 # Varsayılan kontrol 60sn
+            wait_time = 60 # 60 saniyede bir kontrol et
             
             if is_market_open(now_istanbul):
                 if time.time() - last_successful_fetch_time > CACHE_DURATION_SECONDS:
@@ -271,7 +298,7 @@ def background_refresher():
                     fetch_in_progress_event.set()
                     
                     commodity_data = fetch_commodities_data()
-                    # Statik info'yu tekrar çekmeye gerek yok, cache'de var
+                    # Artık statik cache dolu olduğu için bu fonksiyon ad/sektör de içerecek
                     dynamic_data = fetch_dynamic_price_data(BIST100_SYMBOLS)
                     
                     with fetch_lock:
@@ -282,7 +309,7 @@ def background_refresher():
                     fetch_in_progress_event.clear()
                     print(f"[{now_istanbul.strftime('%H:%M:%S')}] [BG] Tam yenileme tamamlandı. {len(cached_data)} varlık.")
             
-            stop_event.wait(wait_time) # 60 saniye bekle
+            stop_event.wait(wait_time)
             
         except Exception as e:
             print(f"Arka plan yenileyici hatası: {e}")
@@ -310,31 +337,31 @@ def get_bist100_index():
         print(f"yfinance hatası (XU100.IS): {e}")
         return jsonify({"error": "Endeks verisi çekilemedi.", "price": None}), 500
 
-# --- Flask Endpoint: BIST100/COMPANIES (DÜZELTİLMİŞ) ---
+# --- Flask Endpoint: BIST100/COMPANIES (NİHAİ) ---
 @app.route('/api/bist100/companies')
 def get_bist100_companies():
     global cached_data, fetch_in_progress_event, fetch_complete_event
 
-    # 1. Önbellek dolu mu? (Artık {} değil, len() > 0 mı?)
+    # 1. Önbellek dolu mu? (len > 0)
     # --workers 1 sayesinde buradaki 'cached_data' her zaman günceldir.
     if len(cached_data) > 0:
         return jsonify(list(cached_data.values()))
 
-    # 2. Önbellek boş. Başlangıç yüklemesi (ilk chunk) sürüyor mu?
+    # 2. Önbellek boş. Hızlı yükleme sürüyor mu?
     now_istanbul = datetime.now(istanbul_tz)
-    print(f"[{now_istanbul.strftime('%H:%M:%S')}] Önbellek boş. İlk aşamanın tamamlanması bekleniyor...")
+    print(f"[{now_istanbul.strftime('%H:%M:%S')}] API İSTEĞİ: Önbellek boş. Hızlı yüklemenin tamamlanması bekleniyor...")
 
     if fetch_in_progress_event.is_set():
-        # İlk chunk'ın bitmesini 60sn bekle
+        # Hızlı yüklemenin bitmesini 60sn bekle
         completed = fetch_complete_event.wait(timeout=60) 
         
         if completed and len(cached_data) > 0:
-            print(f"[{now_istanbul.strftime('%H:%M:%S')}] İlk aşama tamamlandı, veri sunuluyor.")
+            print(f"[{now_istanbul.strftime('%H:%M:%S')}] API İSTEĞİ: Hızlı yükleme tamamlandı, veri sunuluyor.")
             return jsonify(list(cached_data.values()))
         elif completed:
             return jsonify({"error": "Veri çekme işlemi tamamlandı ancak önbellek boş."}), 500
         else: # Timeout
-            print(f"[{now_istanbul.strftime('%H:%M:%S')}] Fetch bekleme zaman aşımına uğradı (60s).")
+            print(f"[{now_istanbul.strftime('%H:%M:%S')}] API İSTEĞİ: Fetch bekleme zaman aşımına uğradı (60s).")
             return jsonify({"error": "Veri çekme işlemi zaman aşımına uğradı."}), 504
     else:
         # Thread çöktüyse bu olabilir
@@ -344,8 +371,9 @@ def get_bist100_companies():
 # --- Uygulama Başlangıcı ---
 print("Flask uygulaması başlatılıyor...")
 
+# Gunicorn --workers 1 kullandığı için, bu blok SADECE BİR KEZ çalışır.
 if not os.environ.get("WERKZEUG_RUN_MAIN"):
-     print("Arka plan thread başlatılıyor (Aşamalı Yükleme)...")
+     print("Arka plan thread başlatılıyor (HIZLI YÜKLEME)...")
      background_thread = threading.Thread(target=background_refresher, daemon=True)
      background_thread.start()
 
