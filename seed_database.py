@@ -125,15 +125,20 @@ def seed_companies():
     print("\nTohumlama işlemi tamamlandı.")
     db.close()
 
+# seed_database.py dosyasının EN ALTI
+
 if __name__ == '__main__':
     print("UYARI: Bu script 'sanbist.db' veritabanını statik verilerle dolduracaktır.")
     print("Bu işlem BIST100 listesi için 2-3 dakika sürebilir.")
-    # input("Devam etmek için ENTER'a basın (veya CTRL+C ile iptal edin)...")
-    
-    # Otomatik çalıştırmak için input'u yorum satırı yaptım.
-    # Eğer bekletmek isterseniz üstteki satırı açıp alttakileri yorumlayın.
     
     start_time = time.time()
+    
+    # YENİ EKLENEN SATIR:
+    print("1. Adım: Veritabanı tabloları oluşturuluyor (varsa atlanacak)...")
+    create_tables() 
+    
+    print("2. Adım: Statik şirket verileri tohumlanıyor...")
     seed_companies()
+    
     end_time = time.time()
     print(f"\nToplam süre: {end_time - start_time:.2f} saniye.")
