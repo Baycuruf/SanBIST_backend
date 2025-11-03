@@ -1,9 +1,10 @@
 # seed_database.py
 import yfinance as yf
-from db_models import db, Company, Price
+# ESKİ: from db_models import db, Company, Price
+# YENİ:
+from db_models import db, Company, Price, create_tables 
 import peewee as pw
 import time
-
 # --- Kaynak Dosyalardan Verileri Al ---
 try:
     from bist100_symbols import BIST100_SYMBOLS
