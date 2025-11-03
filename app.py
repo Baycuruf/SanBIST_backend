@@ -325,23 +325,29 @@ def get_bist100_companies():
         traceback.print_exc()
         return jsonify({"error": "Veritabanı sorgusunda hata oluştu.", "details": str(e)}), 500
 
+# app.py dosyasının EN ALTI
+
 # --- Uygulama Başlangıcı ---
-if __name__ == '__main__':
-    # Veritabanı ve tablolar var mı diye son bir kontrol
-    if not db.table_exists('company') or not db.table_exists('price'):
-        print("HATA: 'company' veya 'price' tablosu bulunamadı.")
-        print("Lütfen önce 'python db_models.py' komutunu çalıştırın.")
-        print("Eğer çalıştırdıysanız, 'python seed_database.py' komutunu çalıştırın.")
-        exit(1)
-        
-    print("Flask uygulaması başlatılıyor...")
-    
-    # Arka plan thread'ini başlat (Flask debug modu çift çalıştırmasın diye kontrol)
-    if not os.environ.get("WERKZEUG_RUN_MAIN"):
-         print("Arka plan fiyat güncelleyici thread başlatılıyor...")
-         background_thread = threading.Thread(target=background_refresher, daemon=True)
-         background_thread.start()
-    
-    # Port 5000
-    print(f"Flask sunucusu http://127.0.0.1:5000 adresinde başlatılıyor...")
-    app.run(debug=True, port=5000)
+# ESKİ KODU SİLİN (if __name__ == '__main__': bloğunun tamamını)
+
+# YENİ KOD:
+# Gunicorn veya başka bir WSGI sunucusu çalıştırıldığında 
+# 'app' değişkenini bulabilmesi için bu kadarını bırakmak yeterlidir.
+
+# Sunucu başlamadan önce veritabanı tablolarının varlığını kontrol et
+# Bu, 'seed' adımının atlanıp atlanmadığını anlamak için iyi bir güvencedir.
+if not db.table_exists('company') or not db.table_exists('price'):
+    print("="*50)
+    print("HATA: 'company' veya 'price' tablosu bulunamadı.")
+    print("Lütfen önce veritabanını 'Build Command' ile oluşturduğunuzdan emin olun.")
+    print("Render Build Command: pip install -r requirements.txt && python seed_database.py")
+    print("="*50)
+
+# Arka plan thread'ini başlat (Flask debug modu çift çalıştırmasın diye kontrol)
+if not os.environ.get("WERKZEUG_RUN_MAIN"):
+     print("Arka plan fiyat güncelleyici thread başlatılıyor...")
+     background_thread = threading.Thread(target=background_refresher, daemon=True)
+     background_thread.start()
+
+print("Flask uygulaması (app) Gunicorn için hazır.")
+print(f"Flask sunucusu http://127.0.0.1:5000 adresinde başlatılıyor...") # Bu log Gunicorn'da farklı görünebilir
